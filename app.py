@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 url = "https://www.ttboost.app/api/coins/check"
 
-
+responses = []
 headers = {
   'User-Agent': "ktor-client",
   'Accept': "application/json",
@@ -31,14 +31,18 @@ def background_worker():
         try:
             res = requests.post(url, data=json.dumps(payload), headers=headers).json()
             if res["success"]==True:
-                print("done add coins : "+str(res["data"]["coins_earned"]))
+                responses.append("done add coins : "+str(res["data"]["coins_earned"]))
             else:
-                print("error add")
+                responses.append("error add")
         except Exception as e:
-            print("⚠️ Error:", e)
+            responses.append({"error": str(e)})
 @app.route("/")
 def home():
-    return "Hello from Flask + Background Worker ✅"
+    if responses:
+        # رجّع آخر رد
+        return f"<h3>آخر رد:</h3><pre>{json.dumps(responses[-1], indent=2)}</pre>"
+    else:
+        return "مافيش ردود لسه ⏳"
 
 if __name__ == "__main__":
     t = threading.Thread(target=background_worker, daemon=True)
