@@ -1,28 +1,30 @@
-import random
-import requests
-import json
+import asyncio
+import threading
+from flask import Flask
 
-url = "https://www.ttboost.app/api/coins/check"
+app = Flask(__name__)
 
+# ---- background task ----
+async def background_task():
+    while True:
+        print("✅ Worker is running in background...")
+        await asyncio.sleep(5)
 
-headers = {
-  'User-Agent': "ktor-client",
-  'Accept': "application/json",
-  'Accept-Encoding': "gzip",
-  'Content-Type': "application/json",
-  'authorization': "Bearer 637808|TDGqqu8tmBafB9B6ayFZv7RDdXZDtb9MpDQHdQHO6d135f9e",
-  'accept-charset': "UTF-8"
-}
-while True:
-    payload = {
-    "order_id": random.randint(1000000, 1899999),
-    "username": "jdhddjdjhdn",
-    "likes_incremented": None,
-    "profile_username": "777mrmydohe",
-    "sec_uid":"MS4wLjABAAAA4o1aH5nuax0I6UMEhAnb2bxT8FOwqaooWdieB1sSV1ZA0b5w7Yd_FIDn0rruKzv7"
-    }
-    res = requests.post(url, data=json.dumps(payload), headers=headers).json()
-    if res["success"]==True:
-        print("done add coins : "+str(res["data"]["coins_earned"]))
-    else:
-        print("error add")
+def start_worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(background_task())
+
+# ---- web endpoint ----
+@app.route("/")
+def home():
+    return "Hello from Flask + Background Worker ✅"
+
+# ---- start both ----
+if __name__ == "__main__":
+    # شغل الـ worker في thread منفصل
+    t = threading.Thread(target=start_worker, daemon=True)
+    t.start()
+
+    # شغل Flask
+    app.run(host="0.0.0.0", port=8080)
