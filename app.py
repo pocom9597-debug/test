@@ -45,6 +45,5 @@ def home():
         return "مافيش ردود لسه ⏳"
 
 if __name__ == "__main__":
-    t = threading.Thread(target=background_worker, daemon=True)
-    t.start()
+    background_worker()
     app.run(host="0.0.0.0", port=8080)
