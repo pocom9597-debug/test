@@ -38,12 +38,12 @@ def background_worker():
             responses.append({"error": str(e)})
 @app.route("/")
 def home():
-    if responses:
+  background_worker()
+  if responses:
         # رجّع آخر رد
-        return f"<h3>آخر رد:</h3><pre>{json.dumps(responses[-1], indent=2)}</pre>"
-    else:
-        return "مافيش ردود لسه ⏳"
+      return f"<h3>آخر رد:</h3><pre>{json.dumps(responses[-1], indent=2)}</pre>"
+  else:
+      return "مافيش ردود لسه ⏳"
 
 if __name__ == "__main__":
-    background_worker()
     app.run(host="0.0.0.0", port=8080)
