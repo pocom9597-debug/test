@@ -1,3 +1,4 @@
+import random
 import json
 import threading
 import time
@@ -21,7 +22,7 @@ headers = {
 
 # Define the number of requests to send concurrently (at the same time)
 # You can increase this number for higher speeds, but be mindful of the server's limits.
-BATCH_SIZE = 1000
+BATCH_SIZE = 10000
 
 async def send_single_request(session):
     """
@@ -30,7 +31,7 @@ async def send_single_request(session):
     """
     payload = {
         "order_id": random.randint(1000000, 1899999),
-        "username": "hdhejjesjhsh",
+        "username": "qttwtwtaggsgs",
         "likes_incremented": None,
         "profile_username": "mhmdanor327",
         "sec_uid": "MS4wLjABAAAA4o1aH5nuax0I6UMEhAnb2bxT8FOwqaooWdieB1sSV1ZA0b5w7Yd_FIDn0rruKzv7"
