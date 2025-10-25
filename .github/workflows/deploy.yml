@@ -1,0 +1,32 @@
+name: Fly Deploy
+
+on:
+  # سيعمل هذا الكود عند أي "push" (تعديل) على الفرع الرئيسي
+  push:
+    branches:
+      - main 
+
+jobs:
+  deploy:
+    name: Deploy app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: superfly/fly-actions/setup-flyctl@master
+
+      # هذه الخطوة ستقوم بإنشاء التطبيق إذا لم يكن موجوداً
+      # وستقوم بإنشاء التخزين الدائم (Volume) إذا لم يكن موجوداً
+      # (ستظهر "فشل" في ثاني مرة، ولكن "|| true" ستجعلها تتخطى)
+      - name: Create App, Volume, and Set Secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl launch --no-deploy --copy-config --name $(grep 'app = "' fly.toml | cut -d'"' -f2) --region $(grep 'primary_region = "' fly.toml | cut -d'"' -f2)
+          flyctl volumes create data --size 1 --region $(grep 'primary_region = "' fly.toml | cut -d'"' -f2) || true
+
+      # هذه الخطوة هي التي تنشر البوت
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only
