@@ -1,6 +1,6 @@
 # اسم التطبيق: يجب أن يكون فريداً على مستوى العالم
 # (اختر اسماً فريداً غير "my-voda-bot-app")
-app = "my-voda-bot-app-12345" 
+app = "mahmoudapp-12345" 
 primary_region = "fra" # (fra = فرانكفورت، منطقة جيدة)
 
 [build]
