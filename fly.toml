@@ -1,0 +1,16 @@
+# اسم التطبيق: يجب أن يكون فريداً على مستوى العالم
+# (اختر اسماً فريداً غير "my-voda-bot-app")
+app = "my-voda-bot-app-12345" 
+primary_region = "fra" # (fra = فرانكفورت، منطقة جيدة)
+
+[build]
+  dockerfile = "Dockerfile"
+
+# هذا يخبر fly.io أن البوت ليس موقع ويب، بل "عامل"
+[processes]
+  app = "python app.py" # (تأكد أن اسم الملف صحيح)
+
+# هذا يربط التخزين الدائم (الذي سننشئه) بالمجلد في الكود
+[mounts]
+  source = "data"
+  destination = "/app/data"
