@@ -368,20 +368,23 @@ def bot_edit_http(chat_id, message_id, text):
 
 def dynamic_countdown(chat_id, total_seconds, message_prefix):
     """
-    يرسل رسالة ويعدلها كل ثانية ليظهر عداد تنازلي.
+    يرسل رسالة ويعدلها كل 10 ثواني (لتجنب الحظر).
     """
     start_text = f"⏳ {message_prefix} بدء العد: {total_seconds} ثانية..."
     sent_msg_data = bot_send_http(chat_id, start_text)
     
     if not sent_msg_data or not sent_msg_data.get('ok'):
         print(f"Failed to send initial countdown message to {chat_id}")
-        return
+        # إذا فشل إرسال الرسالة الأولية (بسبب حظر سابق)، نوقف الدورة
+        raise ScriptStoppedException(f"Failed to send initial countdown message (Maybe Telegram Flood?)")
         
     msg_id = sent_msg_data['result']['message_id']
     
     last_text = ""
+    last_edit_time = time.time()
     
     for i in range(total_seconds, 0, -1):
+        # التحقق من زر الإيقاف كل ثانية
         if not user_script_status.get(chat_id, True):
             bot_edit_http(chat_id, msg_id, f"🛑 {message_prefix} تم الإيقاف يدوياً")
             raise ScriptStoppedException("User requested stop during countdown")
@@ -390,13 +393,26 @@ def dynamic_countdown(chat_id, total_seconds, message_prefix):
         timer_text = f"{m:02d}:{s:02d}"
         new_text = f"⏳ {message_prefix} {timer_text}"
         
-        if new_text != last_text and i % 1 == 0: 
-            bot_edit_http(chat_id, msg_id, new_text)
-            last_text = new_text
+        current_time = time.time()
         
-        time.sleep(1)
+        # ## التعديل الأهم: ##
+        # التحديث فقط كل 10 ثواني (أو إذا كانت هذه آخر ثانية)
+        if (new_text != last_text) and (current_time - last_edit_time > 10 or i == 1): 
+            try:
+                bot_edit_http(chat_id, msg_id, new_text)
+                last_text = new_text
+                last_edit_time = current_time
+            except Exception as e:
+                # إذا فشل التعديل (بسبب الحظر)، نتجاهله ونكمل العد
+                print(f"Failed to edit countdown message: {e}")
         
-    bot_edit_http(chat_id, msg_id, f"✅ {message_prefix} اكتمل الانتظار")
+        time.sleep(1) # ما زلنا ننتظر ثانية، لكننا لا *نعدل* الرسالة
+        
+    try:
+        bot_edit_http(chat_id, msg_id, f"✅ {message_prefix} اكتمل الانتظار")
+    except Exception as e:
+        print(f"Failed to edit final countdown message: {e}")
+
 
 
 def signin(user, pas, config, chat_id):
@@ -474,7 +490,7 @@ def flexMember(config, chat_id):
         bot_send_http(chat_id, "النسبه 10% بالفعل ✅")
     else:
         bot_send_http(chat_id, f"خطاء (تغيير النسبة) ❌ - {response.status_code}")
-    dynamic_countdown(chat_id, 120, "انتظر : ")
+    dynamic_countdown(chat_id, 300, "انتظر : ")
 
 def SendInvitation(config, chat_id):
     if not user_script_status.get(chat_id, True): raise ScriptStoppedException()
@@ -502,7 +518,7 @@ def SendInvitation(config, chat_id):
         bot_send_http(chat_id, "تم حظرك (ارسال دعوة) ❌")
     else:
         bot_send_http(chat_id, f"خطاء (ارسال دعوة) ❌ - {response.status_code}")
-    dynamic_countdown(chat_id, 300, "انتظر : ")
+    dynamic_countdown(chat_id, 60, "انتظر : ")
 
 async def QuotaRedistribution(config, session, chat_id):
     url = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup"
@@ -586,7 +602,7 @@ def FamilyRemoveMember(config, chat_id):
         bot_send_http(chat_id, "تم حظرك (حذف العضو) ❌")
     else:
         bot_send_http(chat_id, f"خطاء (حذف العضو) ❌ -> {response.status_code}")
-    dynamic_countdown(chat_id, 300, "انتظر : ")
+    #dynamic_countdown(chat_id, 300, "انتظر : ")
 
 # --- 8. دالة تشغيل الإسكريبت (في Thread منفصل) ---
 def run_script_loop(user_id, chat_id):
