@@ -1,3 +1,4 @@
-aiogram
-aiohttp
+python-telegram-bot 
+aiohttp 
+aiosocks
 requests
