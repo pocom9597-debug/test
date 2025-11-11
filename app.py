@@ -152,7 +152,7 @@ async def send_file_to_telegram_async(file_path, chat_id, context):
         with open(file_path, 'rb') as document:
             # إضافة تسمية توضيحية لتمييز نوع الملف
             caption = f"✅ بروكسيات عاملة - البروتوكول: {os.path.basename(file_path).split('_')[1].upper()}"
-            await context.bot.send_document(chat_id=chat_id, document=document, caption=caption, timeout=15)
+            await context.bot.send_document(chat_id=chat_id, document=document, caption=caption)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ فشل إرسال الملف {os.path.basename(file_path)}: {e}")
 
