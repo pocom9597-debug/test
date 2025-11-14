@@ -12,8 +12,7 @@ from itertools import count
 # ⚠️ 1. الإعدادات الأساسية (يجب عليك ملؤها) ⚠️
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = '7841209852:AAH047KQNwmEUA2GPRyBi9OP8kP0fJgatOM'  # رمز روبوت التليجرام
-ALLOWED_USER_ID = 6752807419
-# مثال: 123456789 - يرجى تعيينه لأسباب أمنية
+ALLOWED_USER_ID = 6752807419   # مثال: 123456789 - يرجى تعيينه لأسباب أمنية
 
 # مصادر التحميل التلقائي لكميات كبيرة من البروكسي
 DOWNLOAD_URLS = [
@@ -152,7 +151,7 @@ async def send_file_to_telegram_async(file_path, chat_id, context):
         with open(file_path, 'rb') as document:
             # إضافة تسمية توضيحية لتمييز نوع الملف
             caption = f"✅ بروكسيات عاملة - البروتوكول: {os.path.basename(file_path).split('_')[1].upper()}"
-            await context.bot.send_document(chat_id=chat_id, document=document, caption=caption)
+            await context.bot.send_document(chat_id=chat_id, document=document, caption=caption, timeout=15)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ فشل إرسال الملف {os.path.basename(file_path)}: {e}")
 
