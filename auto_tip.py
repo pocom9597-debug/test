@@ -2,11 +2,12 @@
 auto_tip.py — سكريبت التحكم التلقائي بأجهزة Lovense
 =====================================================
 
-يتصل بـ WebSocket، يستنى النموذج يفعّل التحكم،
-وبعدين يبعت tips تلقائي بأنماط مختلفة.
+يتصل بـ WebSocket، يبعت tip عشان ياخد التحكم،
+وبعدين يتحكم في الجهاز بأنماط مختلفة.
 
 الاستخدام:
-    python auto_tip.py
+    python auto_tip.py                  # وضع تلقائي
+    python auto_tip.py --interactive    # وضع تفاعلي
 
 التثبيت:
     pip install python-socketio[asyncio] aiohttp cryptography requests
@@ -19,12 +20,12 @@ import random
 import sys
 import time
 import requests
-
 import socketio
 
 from tipper import (
     get_lovense, LovenseTipperAPI,
     generate_init_signature, SocketEvents,
+    random_code,
 )
 from toy_control import (
     ToyController, ToyControllerAdvanced,
@@ -47,23 +48,167 @@ AUTO_TIP_CONFIG = {
     "enabled": True,
     "mode": "sequential",      # sequential / random / custom
     "interval_sec": 30,        # الوقت بين كل tip (بالثواني)
-    "tip_amounts": [5, 10, 50, 100, 111, 222, 333, 555],  # قيم التيبات
+    "tip_amounts": [5, 10, 50, 100, 111, 222, 333, 555],
     "max_tips": 0,             # 0 = بلا حد
-    "auto_reconnect": True,    # إعادة الاتصال تلقائي لو انقطع
-    "wait_for_control": True,  # استنى التحكم يتفعّل
-    "retry_control_sec": 30,   # إعادة محاولة طلب التحكم
+    "auto_reconnect": True,
+    "wait_for_control": True,
+    "retry_control_sec": 30,
+    "auto_send_entry_tip": True,  # إرسال tip تلقائي عند control_link_not_in_queue
 }
 
 # ══════════════════════════════════════════════════════════════
-# Logging
-# ══════════════════════════════════════════════════════════════
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("AutoTip")
+
+
+# ══════════════════════════════════════════════════════════════
+# دوال إرسال Tip
+# ══════════════════════════════════════════════════════════════
+
+class TipSender:
+    """
+    إرسال Tips عبر Socket.IO.
+
+    المصدر من tipper.js:
+      - fanberry_send_tip: حدث client→server لإرسال tip
+        الداتا: {tid: "unique_id", amount: NUMBER}
+
+      - tipperjs_notify_exec_tip_tc: حدث server→client لإعلام العميل بتيبة
+        الداتا: {camsite: "flash", modelName: "...", customerName: "...", token: NUMBER}
+
+    الآلية:
+      1. العميل يبعت fanberry_send_tip مع المبلغ
+      2. السيرفر يعالج التيبة ويبعت tipperjs_notify_exec_tip_tc
+      3. لو التيبة = giveControl → السيرفر يفتح التحكم
+    """
+
+    def __init__(self, sio: socketio.AsyncClient, config: dict):
+        self._sio = sio
+        self._config = config
+        self._tip_count = 0
+        self._last_tip_response = None
+
+    async def send_tip(self, amount: int, method: str = "auto") -> bool:
+        """
+        إرسال tip بقيمة معينة.
+
+        المعاملات:
+            amount: عدد التوكنات
+            method: طريقة الإرسال
+                - "fanberry": عبر fanberry_send_tip event
+                - "direct":   عبر tipperjs_notify_exec_tip_tc (محاكاة)
+                - "auto":     يجرب fanberry أولاً، ثم direct
+
+        المرجع:
+            tipper.js → TIPPERJS_SEND_TIP handler:
+                o.emitEvent("fanberry_send_tip", {tid: s, amount: i.amount})
+        """
+        if amount <= 0:
+            log.warning("Tip amount must be > 0")
+            return False
+
+        self._tip_count += 1
+        tid = random_code(16)
+
+        if method in ("fanberry", "auto"):
+            success = await self._send_fanberry_tip(amount, tid)
+            if success or method == "fanberry":
+                return success
+
+        if method in ("direct", "auto"):
+            return await self._send_direct_tip(amount)
+
+        return False
+
+    async def _send_fanberry_tip(self, amount: int, tid: str) -> bool:
+        """
+        إرسال tip عبر fanberry_send_tip.
+
+        المصدر: tipper.js → Fanberry class:
+            case "TIPPERJS_SEND_TIP":
+                o.emitEvent("fanberry_send_tip", {tid: s, amount: i.amount})
+
+        الداتا:
+            {tid: "unique_transaction_id", amount: NUMBER}
+        """
+        payload = {
+            "tid": tid,
+            "amount": amount,
+        }
+        log.info(f"💰 Sending tip via fanberry_send_tip: {amount} tokens (tid={tid[:8]}...)")
+
+        try:
+            await self._sio.emit("fanberry_send_tip", payload)
+            log.info(f"✅ fanberry_send_tip emitted: {amount} tokens")
+            return True
+        except Exception as e:
+            log.error(f"❌ fanberry_send_tip failed: {e}")
+            return False
+
+    async def _send_direct_tip(self, amount: int) -> bool:
+        """
+        محاكاة tip عبر إرسال tipperjs_notify_exec_tip_tc مباشرة.
+
+        المصدر: tipper.js → _e() function:
+            r = n || {}
+            o = r.camsite
+            a = r.modelName
+            c = r.customerName
+            f = Number(n.token || 0)
+
+        الداتا:
+            {camsite: "flash", modelName: "...", customerName: "...", token: NUMBER}
+
+        ملاحظة: هذا الحدث عادةً يُرسَل من السيرفر للعميل.
+                 إرساله من العميل قد لا يُعالَج من السيرفر.
+        """
+        payload = json.dumps({
+            "camsite": self._config["platform"],
+            "modelName": self._config["model_name"],
+            "customerName": self._config["customer_name"],
+            "token": amount,
+        })
+        log.info(f"💰 Sending direct tip notification: {amount} tokens")
+
+        try:
+            await self._sio.emit("tipperjs_notify_exec_tip_tc", payload)
+            log.info(f"✅ Direct tip emitted: {amount} tokens")
+            return True
+        except Exception as e:
+            log.error(f"❌ Direct tip failed: {e}")
+            return False
+
+    async def send_givecontrol_tip(self, settings: TipSettings) -> int:
+        """
+        إرسال tip بقيمة giveControl من إعدادات النموذج.
+
+        يبحث في specialCommand عن type=giveControl ويبعت التيبة المطلوبة.
+
+        المرجع: tipSettings.specialCommand[].type === "giveControl"
+            {tokensBegin: 150, tokensEnd: 150, type: "giveControl",
+             controlType: "normal", tokenPerMin: 50, time: 40}
+        """
+        if not settings:
+            log.warning("No tip settings available")
+            return 0
+
+        for cmd in settings.special_commands:
+            if cmd.cmd_type == "giveControl":
+                log.info(f"🎮 Found giveControl: {cmd.tokens} tokens → "
+                         f"{cmd.duration}s control @ {cmd.token_per_min}t/min")
+                await self.send_tip(cmd.tokens)
+                return cmd.tokens
+
+        log.warning("No giveControl command found in tip settings")
+        return 0
+
+    @property
+    def tip_count(self) -> int:
+        return self._tip_count
 
 
 # ══════════════════════════════════════════════════════════════
@@ -74,7 +219,7 @@ class AutoTipper:
     """
     سكريبت التحكم التلقائي.
 
-    يتصل بالسيرفر، يستنى التحكم يتفعّل،
+    يتصل بالسيرفر، يبعت tip عشان ياخد التحكم،
     ويبعت tips تلقائي بأنماط مختلفة.
     """
 
@@ -87,7 +232,6 @@ class AutoTipper:
         self._control_ready = False
         self._toy_connected = False
         self._running = False
-        self._tip_count = 0
         self._session_data = None
 
         # أحداث asyncio
@@ -95,16 +239,17 @@ class AutoTipper:
         self._control_event = asyncio.Event()
         self._toy_event = asyncio.Event()
         self._stop_event = asyncio.Event()
+        self._tip_received_event = asyncio.Event()
 
         # Lovense API
         self._api = get_lovense()
         self._sio = None
         self._ctrl = None
+        self._tip_sender = None
 
     # ── تهيئة الجلسة ──────────────────────────────────────────
 
     def _init_session(self):
-        """تهيئة جلسة Lovense API."""
         self._api.destroy_all()
         self._api.init(
             self.config["platform"],
@@ -114,7 +259,6 @@ class AutoTipper:
         log.info(f"API initialized: {self.config['platform']}/{self.config['model_name'][:20]}...")
 
     def _check_model_status(self) -> bool:
-        """التحقق من حالة النموذج (أونلاين ولا لا)."""
         log.info("Checking model status...")
         try:
             r = requests.post(
@@ -139,7 +283,6 @@ class AutoTipper:
             return False
 
     def _get_session(self) -> dict:
-        """الحصول على بيانات الجلسة (ws_server_url + socketIoPath)."""
         log.info("Getting session data...")
         payload = self._api.build_init_payload()
         try:
@@ -163,17 +306,14 @@ class AutoTipper:
     # ── الاتصال بـ WebSocket ──────────────────────────────────
 
     async def connect(self):
-        """الاتصال بالسيرفر عبر WebSocket."""
         self._init_session()
 
-        # التحقق من حالة النموذج
         if not self._check_model_status():
             log.warning("Model is offline. Waiting...")
             while not self._check_model_status():
                 await asyncio.sleep(30)
             log.info("Model is now online!")
 
-        # الحصول على بيانات الجلسة
         session = self._get_session()
         if not session:
             log.error("Failed to get session data")
@@ -184,10 +324,7 @@ class AutoTipper:
         io_path = session.get("socketIoPath", "/customer")
 
         log.info(f"Connecting to WebSocket...")
-        log.info(f"  URL:  {ws_url[:70]}...")
-        log.info(f"  Path: {io_path}")
 
-        # إنشاء Socket.IO client
         self._sio = socketio.AsyncClient(logger=False, engineio_logger=False)
         self._ctrl = ToyControllerAdvanced(
             self._sio,
@@ -195,18 +332,16 @@ class AutoTipper:
             self.config["model_name"],
             self.config["customer_name"],
         )
+        self._tip_sender = TipSender(self._sio, self.config)
 
-        # تسجيل الأحداث
         self._register_events()
 
-        # الاتصال
         try:
             await self._sio.connect(ws_url, socketio_path=io_path, transports=["websocket"])
         except Exception as e:
             log.error(f"Connection failed: {e}")
             return False
 
-        # انتظار الاتصال
         try:
             await asyncio.wait_for(self._connected_event.wait(), timeout=15)
             log.info("Connected successfully!")
@@ -216,7 +351,6 @@ class AutoTipper:
             return False
 
     def _register_events(self):
-        """تسجيل أحداث Socket.IO."""
         sio = self._sio
         ctrl = self._ctrl
 
@@ -247,7 +381,8 @@ class AutoTipper:
                 data = json.loads(data)
             panel = data.get("panelSwitch", False)
             control = data.get("controlSwitch", False)
-            log.info(f"⚙️  Panel: panelSwitch={panel}, controlSwitch={control}")
+            tip = data.get("tipSwitch", False)
+            log.info(f"⚙️  Panel: panelSwitch={panel}, controlSwitch={control}, tipSwitch={tip}")
 
         @sio.on(SocketEvents.GET_MODEL_TIP_SETT_SS)
         async def on_tip_settings(data):
@@ -255,6 +390,13 @@ class AutoTipper:
                 data = json.loads(data)
             ctrl.load_settings(data)
             log.info("💎 Tip settings loaded from server")
+
+            # عرض إعدادات giveControl
+            if ctrl.settings:
+                for cmd in ctrl.settings.special_commands:
+                    if cmd.cmd_type == "giveControl":
+                        log.info(f"🎮 giveControl available: {cmd.tokens} tokens → "
+                                 f"{cmd.duration}s @ {cmd.token_per_min}t/min")
 
         @sio.on("control_link_ready_notice_cs")
         async def on_control_ready(data):
@@ -266,14 +408,43 @@ class AutoTipper:
         async def on_start_control(data):
             if isinstance(data, str):
                 data = json.loads(data)
-            log.info(f"✅ Control started: {data}")
+            log.info(f"✅ Control started by server: {data}")
             self._control_ready = True
             self._control_event.set()
 
         @sio.on("control_link_not_in_queue_cs")
         async def on_not_in_queue(data):
-            log.info("⏳ Not in queue - control not enabled by model yet")
-            log.info("   Waiting for model to enable viewer control...")
+            """
+            السيرفر بيقول: مش في طابور التحكم.
+            لازم نبعت tip بقيمة giveControl عشان نحصل على التحكم.
+
+            المصدر: tipper.js → control_link_not_in_queue_cs handler
+            """
+            log.info("⏳ Not in queue - need to send tip for control access")
+
+            if self.tip_config.get("auto_send_entry_tip") and ctrl.settings:
+                # البحث عن giveControl في إعدادات التيبات
+                for cmd in ctrl.settings.special_commands:
+                    if cmd.cmd_type == "giveControl":
+                        log.info(f"🎮 Auto-sending giveControl tip: {cmd.tokens} tokens")
+                        await self._tip_sender.send_tip(cmd.tokens)
+                        # انتظار رد السيرفر
+                        await asyncio.sleep(3)
+                        # إعادة طلب التحكم بعد إرسال التيبة
+                        log.info("🔄 Re-requesting control after tip...")
+                        await ctrl.request_control()
+                        return
+
+                log.warning("No giveControl in settings, trying basic tip amounts...")
+                # محاولة بأقل قيمة في basicLevel
+                if ctrl.settings.basic_levels:
+                    min_tip = ctrl.settings.basic_levels[0].tip_begin
+                    log.info(f"💰 Sending basic tip: {min_tip} tokens")
+                    await self._tip_sender.send_tip(min_tip)
+                    await asyncio.sleep(2)
+                    await ctrl.request_control()
+            else:
+                log.info("   Waiting for model to enable control or send tip manually...")
 
         @sio.on("control_link_in_queue_notice_cs")
         async def on_in_queue(data):
@@ -292,7 +463,6 @@ class AutoTipper:
                 self._toy_event.set()
                 log.info(f"📱 Toy connected: {ctrl.toy.toy_name} ({ctrl.toy.toy_type}) "
                          f"🔋{ctrl.toy.battery}%")
-                log.info(f"   Supported modes: {ctrl.toy.supported_modes}")
             else:
                 self._toy_connected = False
                 self._toy_event.clear()
@@ -316,12 +486,41 @@ class AutoTipper:
             self._control_ready = False
             self._control_event.clear()
 
+        @sio.on("tipperjs_notify_exec_tip_tc")
+        async def on_tip_executed(data):
+            """
+            السيرفر بيبلغنا إن tip اتنفذ.
+
+            المصدر: tipper.js:
+                Lt.on("tipperjs_notify_exec_tip_tc", function(t) { _e(formatStringToObj(t)) })
+
+                _e = we() function:
+                    r = n || {}
+                    camsite = r.camsite
+                    modelName = r.modelName
+                    customerName = r.customerName
+                    token = Number(n.token || 0)
+
+            الداتا:
+                {camsite: "flash", modelName: "...", customerName: "...", token: NUMBER}
+            """
+            if isinstance(data, str):
+                data = json.loads(data)
+            tokens = data.get("token", 0)
+            log.info(f"💰 TIP EXECUTED by server: {tokens} tokens!")
+            log.info(f"   Data: {data}")
+            self._tip_received_event.set()
+
+            # تنفيذ الأمر المناسب حسب إعدادات التيبات
+            if ctrl.settings and tokens > 0:
+                await ctrl.execute_tip(tokens)
+
         @sio.on("VibeWithMeTipStatusDTO")
         async def on_external_tip(data):
             if isinstance(data, str):
                 data = json.loads(data)
             tokens = data.get("tokens", 0)
-            log.info(f"💰 External tip received: {tokens} tokens")
+            log.info(f"💰 External tip (VibeWithMe): {tokens} tokens")
 
         @sio.on("tipperjs_notify_send_online_heartbeat_tc")
         async def on_heartbeat(data):
@@ -330,7 +529,6 @@ class AutoTipper:
     # ── طلب التحكم ────────────────────────────────────────────
 
     async def request_control(self) -> bool:
-        """طلب التحكم والانتظار."""
         if not self._connected:
             log.error("Not connected")
             return False
@@ -341,7 +539,7 @@ class AutoTipper:
         # طلب إعدادات اللوحة والتيبات
         await self._sio.emit(SocketEvents.GET_DEVELOPER_PANEL_SETT_CS, {"pf": pf})
         await self._sio.emit(SocketEvents.GET_MODEL_TIP_SETT_CS, {"pf": pf, "modName": mod})
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         # طلب التحكم
         log.info("🎮 Requesting control link...")
@@ -349,14 +547,19 @@ class AutoTipper:
 
         if self.tip_config["wait_for_control"]:
             retry_sec = self.tip_config["retry_control_sec"]
-            while not self._control_ready and self._running:
+            attempts = 0
+            max_attempts = 10
+
+            while not self._control_ready and self._running and attempts < max_attempts:
                 try:
                     await asyncio.wait_for(self._control_event.wait(), timeout=retry_sec)
                     break
                 except asyncio.TimeoutError:
+                    attempts += 1
                     if not self._running:
                         return False
-                    log.info(f"⏳ Still waiting for control... retrying in {retry_sec}s")
+                    log.info(f"⏳ Still waiting for control... attempt {attempts}/{max_attempts}")
+                    # إعادة طلب التحكم
                     await self._ctrl.request_control()
         else:
             try:
@@ -369,10 +572,9 @@ class AutoTipper:
             await self._ctrl.start_control()
             log.info("🟢 Control is active!")
 
-            # انتظار اتصال الجهاز
             try:
                 await asyncio.wait_for(self._toy_event.wait(), timeout=15)
-                log.info(f"🎯 Ready to send tips! Toy: {self._ctrl.toy}")
+                log.info(f"🎯 Ready! Toy: {self._ctrl.toy}")
             except asyncio.TimeoutError:
                 log.warning("Toy not connected yet, but control is active")
 
@@ -380,7 +582,20 @@ class AutoTipper:
 
         return False
 
-    # ── إرسال Tips تلقائي ─────────────────────────────────────
+    # ── إرسال Tips ────────────────────────────────────────────
+
+    async def send_tip(self, amount: int, method: str = "auto"):
+        """
+        إرسال tip بقيمة معينة.
+
+        المعاملات:
+            amount: عدد التوكنات
+            method: "fanberry" / "direct" / "auto"
+        """
+        if not self._tip_sender:
+            log.error("Not connected")
+            return
+        await self._tip_sender.send_tip(amount, method)
 
     async def auto_tip_loop(self):
         """حلقة إرسال Tips تلقائي."""
@@ -390,6 +605,7 @@ class AutoTipper:
         interval = cfg["interval_sec"]
         max_tips = cfg["max_tips"]
         idx = 0
+        tip_count = 0
 
         log.info(f"\n{'='*55}")
         log.info(f"  🚀 Auto-tip started!")
@@ -403,7 +619,7 @@ class AutoTipper:
             if self._stop_event.is_set():
                 break
 
-            if max_tips > 0 and self._tip_count >= max_tips:
+            if max_tips > 0 and tip_count >= max_tips:
                 log.info(f"Reached max tips ({max_tips}). Stopping.")
                 break
 
@@ -420,69 +636,58 @@ class AutoTipper:
                 idx += 1
             elif mode == "random":
                 tokens = random.choice(amounts)
-            elif mode == "custom":
+            else:
                 tokens = amounts[idx % len(amounts)] if amounts else 10
                 idx += 1
-            else:
-                tokens = amounts[0] if amounts else 10
 
             # إرسال التيبة
-            self._tip_count += 1
-            log.info(f"\n💰 [{self._tip_count}] Sending tip: {tokens} tokens")
+            tip_count += 1
+            log.info(f"\n💰 [{tip_count}] Sending tip: {tokens} tokens")
 
             try:
-                await self._ctrl.execute_tip(tokens)
-                log.info(f"✅ Tip #{self._tip_count} sent ({tokens} tokens)")
+                # إرسال عبر fanberry_send_tip
+                await self._tip_sender.send_tip(tokens)
+
+                # تنفيذ أوامر التحكم محلياً كمان
+                if self._ctrl.settings:
+                    await self._ctrl.execute_tip(tokens)
+
+                log.info(f"✅ Tip #{tip_count} sent ({tokens} tokens)")
             except Exception as e:
                 log.error(f"❌ Tip failed: {e}")
 
-            # الانتظار قبل التيبة التالية
+            # الانتظار
             log.info(f"⏳ Next tip in {interval}s...")
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
-                break  # stop_event was set
+                break
             except asyncio.TimeoutError:
-                pass  # normal timeout, continue
+                pass
 
-        log.info(f"\n📊 Auto-tip finished. Total tips sent: {self._tip_count}")
+        log.info(f"\n📊 Auto-tip finished. Total tips sent: {tip_count}")
 
     # ── أوامر يدوية ───────────────────────────────────────────
 
-    async def send_single_tip(self, tokens: int):
-        """إرسال tip واحد يدوي."""
-        if not self._ctrl:
-            log.error("Not connected")
-            return
-        log.info(f"💰 Sending single tip: {tokens} tokens")
-        await self._ctrl.execute_tip(tokens)
-        self._tip_count += 1
-        log.info(f"✅ Tip sent ({tokens} tokens)")
-
     async def send_vibrate(self, level: int, duration: float = 5.0):
-        """إرسال أمر اهتزاز مباشر."""
         if not self._ctrl:
-            log.error("Not connected")
-            return
+            log.error("Not connected"); return
         log.info(f"📳 Vibrate: level={level} for {duration}s")
         await self._ctrl.vibrate(level)
         await asyncio.sleep(duration)
         await self._ctrl.stop()
 
-    async def send_pattern(self, pattern_name: str):
-        """تشغيل نمط جاهز."""
+    async def send_pattern(self, pattern_name: str, duration: int = 10):
         if not self._ctrl:
-            log.error("Not connected")
-            return
-
-        log.info(f"🎵 Running pattern: {pattern_name}")
+            log.error("Not connected"); return
+        log.info(f"🎵 Running pattern: {pattern_name} ({duration}s)")
         if pattern_name == "earthquake":
-            await self._ctrl._pattern_earthquake(10)
+            await self._ctrl._pattern_earthquake(duration)
         elif pattern_name == "fireworks":
-            await self._ctrl._pattern_fireworks(10)
+            await self._ctrl._pattern_fireworks(duration)
         elif pattern_name == "wave":
-            await self._ctrl._pattern_wave(10)
+            await self._ctrl._pattern_wave(duration)
         elif pattern_name == "pulse":
-            await self._ctrl.pulse(peak=20, duration=0.5, cycles=5)
+            await self._ctrl.pulse(peak=20, duration=0.5, cycles=max(1, duration // 2))
         elif pattern_name == "ramp":
             await self._ctrl.ramp_up(0, 20, step=2, delay=0.3)
             await self._ctrl.ramp_down(20, 0, step=2, delay=0.3)
@@ -492,12 +697,11 @@ class AutoTipper:
     # ── التشغيل الرئيسي ──────────────────────────────────────
 
     async def run(self):
-        """التشغيل الرئيسي: اتصال → تحكم → tips تلقائي."""
         self._running = True
         self._stop_event.clear()
 
         print(f"\n{'█'*55}")
-        print(f"  🤖 Lovense Auto-Tipper")
+        print(f"  🤖 Lovense Auto-Tipper v2")
         print(f"{'█'*55}")
         print(f"\n  Platform:  {self.config['platform']}")
         print(f"  Model:     {self.config['model_name'][:25]}...")
@@ -509,92 +713,108 @@ class AutoTipper:
             log.error("Failed to connect. Exiting.")
             return
 
-        # 2. طلب التحكم
+        # 2. طلب التحكم (مع إرسال tip تلقائي لو مطلوب)
         if not await self.request_control():
-            log.error("Failed to get control. Exiting.")
-            await self._sio.disconnect()
-            return
+            log.warning("Could not get control via normal flow.")
+            log.info("Trying to send giveControl tip...")
+
+            if self._ctrl.settings:
+                tokens = await self._tip_sender.send_givecontrol_tip(self._ctrl.settings)
+                if tokens > 0:
+                    await asyncio.sleep(5)
+                    # إعادة محاولة التحكم
+                    self._control_event.clear()
+                    await self._ctrl.request_control()
+                    try:
+                        await asyncio.wait_for(self._control_event.wait(), timeout=30)
+                        await self._ctrl.start_control()
+                        log.info("🟢 Control acquired after tip!")
+                    except asyncio.TimeoutError:
+                        log.error("Still no control after tip. The model may need to approve.")
 
         # 3. عرض معلومات الجهاز
-        if self._ctrl.toy.connected:
+        if self._ctrl and self._ctrl.toy.connected:
             print(f"\n{'─'*55}")
             print(f"  🔧 Device:  {self._ctrl.toy.toy_name} ({self._ctrl.toy.toy_type})")
             print(f"  🔧 Modes:   {self._ctrl.toy.supported_modes}")
             print(f"  🔋 Battery: {self._ctrl.toy.battery}%")
             print(f"{'─'*55}")
 
-        # 4. عرض إعدادات التيبات من السيرفر
-        if self._ctrl.settings:
+        if self._ctrl and self._ctrl.settings:
             print(f"\n  📊 Server tip settings:")
             self._ctrl.settings.print_summary()
 
-        # 5. تشغيل حلقة التيبات التلقائية
+        # 4. تشغيل حلقة التيبات التلقائية
         if self.tip_config["enabled"]:
             await self.auto_tip_loop()
         else:
-            log.info("Auto-tip disabled. Use send_single_tip() or send_pattern()")
-            # البقاء متصل
+            log.info("Auto-tip disabled. Staying connected...")
             await self._sio.wait()
 
     async def stop(self):
-        """إيقاف السكريبت."""
         log.info("Stopping...")
         self._running = False
         self._stop_event.set()
 
         if self._ctrl and self._ctrl.in_control:
-            await self._ctrl.stop()
-            await self._ctrl.end_control()
+            try:
+                await self._ctrl.stop()
+                await self._ctrl.end_control()
+            except Exception:
+                pass
 
         if self._sio and self._connected:
-            await self._sio.disconnect()
+            try:
+                await self._sio.disconnect()
+            except Exception:
+                pass
 
         log.info("Stopped.")
 
     # ── الوضع التفاعلي ────────────────────────────────────────
 
     async def interactive_mode(self):
-        """
-        الوضع التفاعلي: يتصل ويستنى التحكم،
-        وبعدين يسمحلك تبعت أوامر يدوية.
-        """
         self._running = True
         self._stop_event.clear()
         self.tip_config["enabled"] = False
 
         print(f"\n{'█'*55}")
-        print(f"  🎮 Lovense Interactive Controller")
+        print(f"  🎮 Lovense Interactive Controller v2")
         print(f"{'█'*55}")
 
-        # الاتصال والتحكم
         if not await self.connect():
             return
-        if not await self.request_control():
-            await self._sio.disconnect()
-            return
 
-        # عرض الأوامر المتاحة
+        # طلب التحكم
+        control_ok = await self.request_control()
+        if not control_ok:
+            log.info("Control not ready yet. You can send tips to get control.")
+
         print(f"\n{'═'*55}")
         print("  الأوامر المتاحة:")
         print("  ─────────────────────────────────────────────────")
-        print("  tip <amount>     → إرسال tip بقيمة معينة")
-        print("  vib <level>      → اهتزاز (0-20)")
-        print("  stop             → إيقاف الجهاز")
-        print("  earthquake       → نمط زلزال (10s)")
-        print("  fireworks        → نمط ألعاب نارية (10s)")
-        print("  wave             → نمط موجة (10s)")
-        print("  pulse            → نبضات (5 دورات)")
-        print("  ramp             → صعود وهبوط تدريجي")
-        print("  auto             → تشغيل التيبات التلقائية")
-        print("  status           → حالة الجهاز")
-        print("  quit / exit      → خروج")
+        print("  tip <amount>           → إرسال tip (fanberry)")
+        print("  tip <amount> direct    → إرسال tip (direct)")
+        print("  tip <amount> fanberry  → إرسال tip (fanberry)")
+        print("  givecontrol            → إرسال tip بقيمة giveControl")
+        print("  vib <level> [seconds]  → اهتزاز (0-20)")
+        print("  stop                   → إيقاف الجهاز")
+        print("  earthquake [seconds]   → نمط زلزال")
+        print("  fireworks [seconds]    → نمط ألعاب نارية")
+        print("  wave [seconds]         → نمط موجة")
+        print("  pulse [seconds]        → نبضات")
+        print("  ramp                   → صعود وهبوط تدريجي")
+        print("  auto                   → تشغيل التيبات التلقائية")
+        print("  control                → إعادة طلب التحكم")
+        print("  status                 → حالة الاتصال والجهاز")
+        print("  settings               → عرض إعدادات التيبات")
+        print("  quit / exit            → خروج")
         print(f"{'═'*55}\n")
 
-        # حلقة الأوامر
         while self._running:
             try:
                 cmd = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: input("🎮 > ").strip().lower()
+                    None, lambda: input("🎮 > ").strip()
                 )
             except (EOFError, KeyboardInterrupt):
                 break
@@ -602,7 +822,7 @@ class AutoTipper:
             if not cmd:
                 continue
 
-            parts = cmd.split()
+            parts = cmd.lower().split()
             action = parts[0]
 
             try:
@@ -611,7 +831,17 @@ class AutoTipper:
 
                 elif action == "tip" and len(parts) > 1:
                     tokens = int(parts[1])
-                    await self.send_single_tip(tokens)
+                    method = parts[2] if len(parts) > 2 else "auto"
+                    await self.send_tip(tokens, method)
+
+                elif action == "givecontrol":
+                    if self._ctrl and self._ctrl.settings:
+                        tokens = await self._tip_sender.send_givecontrol_tip(self._ctrl.settings)
+                        if tokens > 0:
+                            await asyncio.sleep(3)
+                            await self._ctrl.request_control()
+                    else:
+                        log.warning("No tip settings loaded yet")
 
                 elif action == "vib" and len(parts) > 1:
                     level = int(parts[1])
@@ -619,26 +849,41 @@ class AutoTipper:
                     await self.send_vibrate(level, duration)
 
                 elif action == "stop":
-                    await self._ctrl.stop()
+                    if self._ctrl:
+                        await self._ctrl.stop()
                     log.info("⏹ Stopped")
 
                 elif action in ("earthquake", "fireworks", "wave", "pulse", "ramp"):
-                    await self.send_pattern(action)
+                    duration = int(parts[1]) if len(parts) > 1 else 10
+                    await self.send_pattern(action, duration)
 
                 elif action == "auto":
                     self.tip_config["enabled"] = True
                     await self.auto_tip_loop()
                     self.tip_config["enabled"] = False
 
+                elif action == "control":
+                    self._control_event.clear()
+                    self._control_ready = False
+                    await self.request_control()
+
                 elif action == "status":
-                    print(f"  Connected: {self._connected}")
-                    print(f"  Control:   {self._control_ready}")
-                    print(f"  Toy:       {self._ctrl.toy}")
-                    print(f"  Tips sent: {self._tip_count}")
+                    print(f"  Connected:  {self._connected}")
+                    print(f"  Control:    {self._control_ready}")
+                    print(f"  Toy:        {self._ctrl.toy if self._ctrl else 'N/A'}")
+                    print(f"  Tips sent:  {self._tip_sender.tip_count if self._tip_sender else 0}")
+                    if self._ctrl and self._ctrl.toy.connected:
+                        print(f"  Modes:      {self._ctrl.toy.supported_modes}")
+                        print(f"  Battery:    {self._ctrl.toy.battery}%")
+
+                elif action == "settings":
+                    if self._ctrl and self._ctrl.settings:
+                        self._ctrl.settings.print_summary()
+                    else:
+                        log.warning("No settings loaded")
 
                 else:
                     print(f"  ❓ أمر غير معروف: {cmd}")
-                    print("  اكتب 'quit' للخروج")
 
             except ValueError as e:
                 print(f"  ❌ قيمة غير صحيحة: {e}")
@@ -655,7 +900,6 @@ class AutoTipper:
 async def main():
     tipper = AutoTipper(CONFIG, AUTO_TIP_CONFIG)
 
-    # اختيار الوضع
     if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
         await tipper.interactive_mode()
     else:
